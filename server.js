@@ -20,17 +20,18 @@ const DB_PATH = path.join(__dirname, "db.json");
 // ---------- Tiny JSON "database" ----------
 function loadDB() {
   if (!fs.existsSync(DB_PATH)) {
-    const fresh = { participants: {}, checkins: [], quizSubmissions: [], impactWall: [] };
+    const fresh = { participants: {}, checkins: [], quizSubmissions: [], impactWall: [], prayerWall: [] };
     fs.writeFileSync(DB_PATH, JSON.stringify(fresh, null, 2));
     return fresh;
   }
   try {
     const db = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
     if (!db.impactWall) db.impactWall = []; // upgrade older db.json files in place
+    if (!db.prayerWall) db.prayerWall = []; // upgrade older db.json files in place
     return db;
   } catch (e) {
     console.error("DB read failed, starting fresh:", e.message);
-    return { participants: {}, checkins: [], quizSubmissions: [], impactWall: [] };
+    return { participants: {}, checkins: [], quizSubmissions: [], impactWall: [], prayerWall: [] };
   }
 }
 
@@ -253,6 +254,66 @@ route("GET", "/api/impact/recent", async (req, res) => {
   const db = loadDB();
   const recent = db.impactWall.slice(-60).reverse();
   send(res, 200, { ok: true, total: db.impactWall.length, recent });
+});
+
+// Submit a prayer request to the Prayer Wall
+// body: { name, phone, location, request }
+route("POST", "/api/prayer/submit", async (req, res) => {
+  const body = await readBody(req);
+  const { name, phone, location, request } = body;
+  if (!name || !request || !request.trim()) {
+    return send(res, 400, { ok: false, error: "name and request are required" });
+  }
+  if (request.trim().length > 400) {
+    return send(res, 400, { ok: false, error: "request is too long (max 400 characters)" });
+  }
+
+  const db = loadDB();
+  const p = getOrCreateParticipant(db, name, phone);
+
+  const isFirst = !p.prayerSubmitted;
+  if (isFirst) {
+    p.prayerSubmitted = true;
+    p.points += POINTS.impactSubmit; // same reward as an impact message
+  }
+
+  db.prayerWall.push({
+    id: crypto.randomUUID(),
+    participantId: p.id,
+    name: p.name,
+    location: (location || "").trim(),
+    request: request.trim(),
+    prayedFor: 0,
+    at: new Date().toISOString(),
+  });
+  saveDB(db);
+
+  send(res, 200, {
+    ok: true,
+    alreadySubmitted: !isFirst,
+    participant: { name: p.name, points: p.points },
+  });
+});
+
+// Recent prayer requests
+route("GET", "/api/prayer/recent", async (req, res) => {
+  const db = loadDB();
+  const recent = db.prayerWall.slice(-80).reverse();
+  send(res, 200, { ok: true, total: db.prayerWall.length, recent });
+});
+
+// Mark "I prayed for this" on a request
+// body: { id }
+route("POST", "/api/prayer/pray", async (req, res) => {
+  const body = await readBody(req);
+  const { id } = body;
+  if (!id) return send(res, 400, { ok: false, error: "id is required" });
+  const db = loadDB();
+  const item = db.prayerWall.find((x) => x.id === id);
+  if (!item) return send(res, 404, { ok: false, error: "not found" });
+  item.prayedFor = (item.prayedFor || 0) + 1;
+  saveDB(db);
+  send(res, 200, { ok: true, prayedFor: item.prayedFor });
 });
 
 // Lookup a single participant's progress (for "my progress" view)
