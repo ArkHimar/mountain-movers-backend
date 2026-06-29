@@ -20,7 +20,7 @@ const DB_PATH = path.join(__dirname, "db.json");
 // ---------- Tiny JSON "database" ----------
 function loadDB() {
   if (!fs.existsSync(DB_PATH)) {
-    const fresh = { participants: {}, checkins: [], quizSubmissions: [], impactWall: [], prayerWall: [], linkClicks: { mixlr: 0, youtube: 0 } };
+    const fresh = { participants: {}, checkins: [], quizSubmissions: [], impactWall: [], prayerWall: [], testimonyWall: [], linkClicks: { mixlr: 0, youtube: 0 } };
     fs.writeFileSync(DB_PATH, JSON.stringify(fresh, null, 2));
     return fresh;
   }
@@ -28,11 +28,12 @@ function loadDB() {
     const db = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
     if (!db.impactWall) db.impactWall = []; // upgrade older db.json files in place
     if (!db.prayerWall) db.prayerWall = []; // upgrade older db.json files in place
+    if (!db.testimonyWall) db.testimonyWall = []; // upgrade older db.json files in place
     if (!db.linkClicks) db.linkClicks = { mixlr: 0, youtube: 0 }; // upgrade older db.json files in place
     return db;
   } catch (e) {
     console.error("DB read failed, starting fresh:", e.message);
-    return { participants: {}, checkins: [], quizSubmissions: [], impactWall: [], prayerWall: [], linkClicks: { mixlr: 0, youtube: 0 } };
+    return { participants: {}, checkins: [], quizSubmissions: [], impactWall: [], prayerWall: [], testimonyWall: [], linkClicks: { mixlr: 0, youtube: 0 } };
   }
 }
 
@@ -317,6 +318,52 @@ route("POST", "/api/prayer/pray", async (req, res) => {
   send(res, 200, { ok: true, prayedFor: item.prayedFor });
 });
 
+// Submit a testimony ("What mountain did God move for you?")
+// body: { name, phone, location, testimony, mountain }
+route("POST", "/api/testimony/submit", async (req, res) => {
+  const body = await readBody(req);
+  const { name, phone, location, testimony, mountain } = body;
+  if (!name || !testimony || !testimony.trim()) {
+    return send(res, 400, { ok: false, error: "name and testimony are required" });
+  }
+  if (testimony.trim().length > 600) {
+    return send(res, 400, { ok: false, error: "testimony is too long (max 600 characters)" });
+  }
+
+  const db = loadDB();
+  const p = getOrCreateParticipant(db, name, phone);
+
+  const isFirst = !p.testimonySubmitted;
+  if (isFirst) {
+    p.testimonySubmitted = true;
+    p.points += POINTS.impactSubmit;
+  }
+
+  db.testimonyWall.push({
+    id: crypto.randomUUID(),
+    participantId: p.id,
+    name: p.name,
+    location: (location || "").trim(),
+    mountain: (mountain || "").trim(),
+    testimony: testimony.trim(),
+    at: new Date().toISOString(),
+  });
+  saveDB(db);
+
+  send(res, 200, {
+    ok: true,
+    alreadySubmitted: !isFirst,
+    participant: { name: p.name, points: p.points },
+  });
+});
+
+// Recent testimonies
+route("GET", "/api/testimony/recent", async (req, res) => {
+  const db = loadDB();
+  const recent = db.testimonyWall.slice(-80).reverse();
+  send(res, 200, { ok: true, total: db.testimonyWall.length, recent });
+});
+
 // Track a click on a live-platform link (Mixlr / YouTube)
 // body: { target: "mixlr" | "youtube" }
 route("POST", "/api/track/click", async (req, res) => {
@@ -386,6 +433,7 @@ route("GET", "/api/report", async (req, res) => {
     },
     impactMessages: (db.impactWall || []).length,
     prayerRequests: (db.prayerWall || []).length,
+    testimonies: (db.testimonyWall || []).length,
   });
 });
 
