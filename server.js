@@ -1,0 +1,316 @@
+/**
+ * Mountain Movers Convention App — Backend
+ * Plain Node.js (no dependencies) so it deploys cleanly on any free Node host
+ * (Render, Railway, Cyclic, Glitch, etc.) with zero install surprises.
+ *
+ * Data is stored in a local JSON file (db.json). This is fine for a
+ * convention-week app. If you outgrow it, swap saveDB()/loadDB() for a
+ * real database later — every route already goes through those two
+ * functions only.
+ */
+
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+
+const PORT = process.env.PORT || 4000;
+const DB_PATH = path.join(__dirname, "db.json");
+
+// ---------- Tiny JSON "database" ----------
+function loadDB() {
+  if (!fs.existsSync(DB_PATH)) {
+    const fresh = { participants: {}, checkins: [], quizSubmissions: [], impactWall: [] };
+    fs.writeFileSync(DB_PATH, JSON.stringify(fresh, null, 2));
+    return fresh;
+  }
+  try {
+    const db = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
+    if (!db.impactWall) db.impactWall = []; // upgrade older db.json files in place
+    return db;
+  } catch (e) {
+    console.error("DB read failed, starting fresh:", e.message);
+    return { participants: {}, checkins: [], quizSubmissions: [], impactWall: [] };
+  }
+}
+
+function saveDB(db) {
+  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
+}
+
+// Points configuration — change freely
+const POINTS = {
+  checkin: 10,        // per unique venue/spot check-in
+  quizCorrect: 5,      // per correct quiz answer
+  quizComplete: 15,    // bonus for finishing the whole quiz
+  impactSubmit: 10,    // for submitting a "60 Seconds of Impact" message
+};
+
+const VENUES = ["dtce", "psf", "main-3x3-km", "old-auditorium", "around-the-camp"];
+
+function getOrCreateParticipant(db, name, phone) {
+  const key = (phone && phone.trim()) ? phone.trim() : name.trim().toLowerCase();
+  if (!db.participants[key]) {
+    db.participants[key] = {
+      id: key,
+      name: name.trim(),
+      phone: phone ? phone.trim() : "",
+      points: 0,
+      venuesVisited: [],
+      quizScore: 0,
+      quizCompletedAt: null,
+      impactSubmitted: false,
+      createdAt: new Date().toISOString(),
+    };
+  }
+  // upgrade older participant records that predate this field
+  if (db.participants[key].impactSubmitted === undefined) {
+    db.participants[key].impactSubmitted = false;
+  }
+  return db.participants[key];
+}
+
+// ---------- Helpers ----------
+function send(res, status, body) {
+  const json = JSON.stringify(body);
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+  });
+  res.end(json);
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (chunk) => {
+      data += chunk;
+      if (data.length > 1e6) req.destroy(); // 1MB safety cap
+    });
+    req.on("end", () => {
+      if (!data) return resolve({});
+      try {
+        resolve(JSON.parse(data));
+      } catch (e) {
+        reject(e);
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+function leaderboardView(db) {
+  return Object.values(db.participants)
+    .map((p) => ({
+      name: p.name,
+      points: p.points,
+      venuesVisited: p.venuesVisited.length,
+      quizScore: p.quizScore,
+      impactSubmitted: !!p.impactSubmitted,
+    }))
+    .sort((a, b) => b.points - a.points)
+    .slice(0, 50);
+}
+
+// ---------- Routes ----------
+const routes = [];
+function route(method, pattern, handler) {
+  routes.push({ method, pattern, handler });
+}
+
+route("GET", "/api/health", async (req, res) => {
+  send(res, 200, { ok: true, time: new Date().toISOString() });
+});
+
+// Check in at a venue
+// body: { name, phone, venue }
+route("POST", "/api/checkin", async (req, res) => {
+  const body = await readBody(req);
+  const { name, phone, venue } = body;
+  if (!name || !venue) return send(res, 400, { ok: false, error: "name and venue are required" });
+  if (!VENUES.includes(venue)) return send(res, 400, { ok: false, error: "unknown venue" });
+
+  const db = loadDB();
+  const p = getOrCreateParticipant(db, name, phone);
+
+  const already = p.venuesVisited.includes(venue);
+  if (!already) {
+    p.venuesVisited.push(venue);
+    p.points += POINTS.checkin;
+    db.checkins.push({
+      id: crypto.randomUUID(),
+      participantId: p.id,
+      name: p.name,
+      venue,
+      at: new Date().toISOString(),
+    });
+    saveDB(db);
+  }
+
+  send(res, 200, {
+    ok: true,
+    alreadyCheckedIn: already,
+    participant: { name: p.name, points: p.points, venuesVisited: p.venuesVisited },
+  });
+});
+
+// Get check-in count + recent log for a venue
+route("GET", "/api/checkins/:venue", async (req, res, params) => {
+  const venue = params.venue;
+  if (!VENUES.includes(venue)) return send(res, 404, { ok: false, error: "unknown venue" });
+  const db = loadDB();
+  const entries = db.checkins.filter((c) => c.venue === venue);
+  const recent = entries.slice(-20).reverse().map((c) => ({ name: c.name, at: c.at }));
+  send(res, 200, { ok: true, venue, total: entries.length, recent });
+});
+
+// Submit quiz results
+// body: { name, phone, answers: [{questionId, correct}], score }
+route("POST", "/api/quiz/submit", async (req, res) => {
+  const body = await readBody(req);
+  const { name, phone, score, total } = body;
+  if (!name || typeof score !== "number") {
+    return send(res, 400, { ok: false, error: "name and numeric score are required" });
+  }
+
+  const db = loadDB();
+  const p = getOrCreateParticipant(db, name, phone);
+
+  const isFirstAttempt = !p.quizCompletedAt;
+  const pointsEarned = score * POINTS.quizCorrect + (isFirstAttempt ? POINTS.quizComplete : 0);
+
+  // Only count points + leaderboard score for the best attempt
+  if (score > p.quizScore || isFirstAttempt) {
+    p.points += isFirstAttempt ? pointsEarned : (score - p.quizScore) * POINTS.quizCorrect;
+    p.quizScore = Math.max(p.quizScore, score);
+  }
+  p.quizCompletedAt = new Date().toISOString();
+
+  db.quizSubmissions.push({
+    id: crypto.randomUUID(),
+    participantId: p.id,
+    name: p.name,
+    score,
+    total: total || null,
+    at: new Date().toISOString(),
+  });
+  saveDB(db);
+
+  send(res, 200, {
+    ok: true,
+    participant: { name: p.name, points: p.points, quizScore: p.quizScore },
+  });
+});
+
+// Leaderboard
+route("GET", "/api/leaderboard", async (req, res) => {
+  const db = loadDB();
+  send(res, 200, { ok: true, leaderboard: leaderboardView(db) });
+});
+
+// Submit a "60 Seconds of Impact" message
+// body: { name, phone, location, message }
+route("POST", "/api/impact/submit", async (req, res) => {
+  const body = await readBody(req);
+  const { name, phone, location, message } = body;
+  if (!name || !message || !message.trim()) {
+    return send(res, 400, { ok: false, error: "name and message are required" });
+  }
+  if (message.trim().length > 400) {
+    return send(res, 400, { ok: false, error: "message is too long (max 400 characters)" });
+  }
+
+  const db = loadDB();
+  const p = getOrCreateParticipant(db, name, phone);
+
+  const isFirst = !p.impactSubmitted;
+  if (isFirst) {
+    p.impactSubmitted = true;
+    p.points += POINTS.impactSubmit;
+  }
+
+  db.impactWall.push({
+    id: crypto.randomUUID(),
+    participantId: p.id,
+    name: p.name,
+    location: (location || "").trim(),
+    message: message.trim(),
+    at: new Date().toISOString(),
+  });
+  saveDB(db);
+
+  send(res, 200, {
+    ok: true,
+    alreadySubmitted: !isFirst,
+    participant: { name: p.name, points: p.points },
+  });
+});
+
+// Recent / all "60 Seconds of Impact" wall messages
+route("GET", "/api/impact/recent", async (req, res) => {
+  const db = loadDB();
+  const recent = db.impactWall.slice(-60).reverse();
+  send(res, 200, { ok: true, total: db.impactWall.length, recent });
+});
+
+// Lookup a single participant's progress (for "my progress" view)
+route("GET", "/api/participant/:id", async (req, res, params) => {
+  const db = loadDB();
+  const key = decodeURIComponent(params.id).trim().toLowerCase();
+  const p = db.participants[key] || Object.values(db.participants).find(
+    (x) => x.name.trim().toLowerCase() === key
+  );
+  if (!p) return send(res, 404, { ok: false, error: "not found" });
+  send(res, 200, { ok: true, participant: p });
+});
+
+// ---------- Tiny router matching ----------
+function matchRoute(method, pathname) {
+  for (const r of routes) {
+    if (r.method !== method) continue;
+    const patternParts = r.pattern.split("/").filter(Boolean);
+    const pathParts = pathname.split("/").filter(Boolean);
+    if (patternParts.length !== pathParts.length) continue;
+    const params = {};
+    let ok = true;
+    for (let i = 0; i < patternParts.length; i++) {
+      if (patternParts[i].startsWith(":")) {
+        params[patternParts[i].slice(1)] = pathParts[i];
+      } else if (patternParts[i] !== pathParts[i]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return { handler: r.handler, params };
+  }
+  return null;
+}
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+    });
+    return res.end();
+  }
+
+  const match = matchRoute(req.method, url.pathname);
+  if (!match) return send(res, 404, { ok: false, error: "not found" });
+
+  try {
+    await match.handler(req, res, match.params);
+  } catch (e) {
+    console.error(e);
+    send(res, 500, { ok: false, error: "server error" });
+  }
+});
+
+server.listen(PORT, () => {
+  console.log(`Mountain Movers backend running on port ${PORT}`);
+});
