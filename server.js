@@ -20,7 +20,7 @@ const DB_PATH = path.join(__dirname, "db.json");
 // ---------- Tiny JSON "database" ----------
 function loadDB() {
   if (!fs.existsSync(DB_PATH)) {
-    const fresh = { participants: {}, checkins: [], quizSubmissions: [], impactWall: [], prayerWall: [] };
+    const fresh = { participants: {}, checkins: [], quizSubmissions: [], impactWall: [], prayerWall: [], linkClicks: { mixlr: 0, youtube: 0 } };
     fs.writeFileSync(DB_PATH, JSON.stringify(fresh, null, 2));
     return fresh;
   }
@@ -28,10 +28,11 @@ function loadDB() {
     const db = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
     if (!db.impactWall) db.impactWall = []; // upgrade older db.json files in place
     if (!db.prayerWall) db.prayerWall = []; // upgrade older db.json files in place
+    if (!db.linkClicks) db.linkClicks = { mixlr: 0, youtube: 0 }; // upgrade older db.json files in place
     return db;
   } catch (e) {
     console.error("DB read failed, starting fresh:", e.message);
-    return { participants: {}, checkins: [], quizSubmissions: [], impactWall: [], prayerWall: [] };
+    return { participants: {}, checkins: [], quizSubmissions: [], impactWall: [], prayerWall: [], linkClicks: { mixlr: 0, youtube: 0 } };
   }
 }
 
@@ -47,7 +48,7 @@ const POINTS = {
   impactSubmit: 10,    // for submitting a "60 Seconds of Impact" message
 };
 
-const VENUES = ["dtce", "psf", "main-3x3-km", "old-auditorium", "around-the-camp"];
+const VENUES = ["main-3x3-km", "old-auditorium", "dtce", "psf", "around-the-camp"];
 
 function getOrCreateParticipant(db, name, phone) {
   const key = (phone && phone.trim()) ? phone.trim() : name.trim().toLowerCase();
@@ -314,6 +315,78 @@ route("POST", "/api/prayer/pray", async (req, res) => {
   item.prayedFor = (item.prayedFor || 0) + 1;
   saveDB(db);
   send(res, 200, { ok: true, prayedFor: item.prayedFor });
+});
+
+// Track a click on a live-platform link (Mixlr / YouTube)
+// body: { target: "mixlr" | "youtube" }
+route("POST", "/api/track/click", async (req, res) => {
+  const body = await readBody(req);
+  const target = (body.target || "").toLowerCase();
+  if (target !== "mixlr" && target !== "youtube") {
+    return send(res, 400, { ok: false, error: "target must be 'mixlr' or 'youtube'" });
+  }
+  const db = loadDB();
+  if (!db.linkClicks) db.linkClicks = { mixlr: 0, youtube: 0 };
+  db.linkClicks[target] = (db.linkClicks[target] || 0) + 1;
+  saveDB(db);
+  send(res, 200, { ok: true, linkClicks: db.linkClicks });
+});
+
+// Admin report — link clicks, quiz takers, and check-ins.
+// Optionally protected: set ADMIN_KEY in the environment, then call
+// /api/report?key=YOUR_KEY. If ADMIN_KEY is not set, the report is open.
+route("GET", "/api/report", async (req, res) => {
+  const ADMIN_KEY = process.env.ADMIN_KEY;
+  if (ADMIN_KEY) {
+    const u = new URL(req.url, `http://${req.headers.host}`);
+    if (u.searchParams.get("key") !== ADMIN_KEY) {
+      return send(res, 401, { ok: false, error: "unauthorized" });
+    }
+  }
+
+  const db = loadDB();
+  const clicks = db.linkClicks || { mixlr: 0, youtube: 0 };
+
+  // Quiz takers: participants who have completed the quiz at least once
+  const quizTakers = Object.values(db.participants)
+    .filter((p) => p.quizCompletedAt)
+    .map((p) => ({ name: p.name, quizScore: p.quizScore, at: p.quizCompletedAt }))
+    .sort((a, b) => new Date(b.at) - new Date(a.at));
+
+  // Check-ins: group by participant, plus a per-venue tally
+  const perVenue = {};
+  VENUES.forEach((v) => (perVenue[v] = 0));
+  const peopleMap = {};
+  db.checkins.forEach((c) => {
+    perVenue[c.venue] = (perVenue[c.venue] || 0) + 1;
+    if (!peopleMap[c.participantId]) peopleMap[c.participantId] = { name: c.name, venues: [], lastAt: c.at };
+    peopleMap[c.participantId].venues.push(c.venue);
+    if (new Date(c.at) > new Date(peopleMap[c.participantId].lastAt)) peopleMap[c.participantId].lastAt = c.at;
+  });
+  const checkinPeople = Object.values(peopleMap).sort((a, b) => b.venues.length - a.venues.length);
+
+  send(res, 200, {
+    ok: true,
+    generatedAt: new Date().toISOString(),
+    linkClicks: {
+      mixlr: clicks.mixlr || 0,
+      youtube: clicks.youtube || 0,
+      total: (clicks.mixlr || 0) + (clicks.youtube || 0),
+    },
+    quiz: {
+      totalTakers: quizTakers.length,
+      totalAttempts: db.quizSubmissions.length,
+      takers: quizTakers,
+    },
+    checkins: {
+      totalCheckins: db.checkins.length,
+      uniquePeople: checkinPeople.length,
+      perVenue,
+      people: checkinPeople,
+    },
+    impactMessages: (db.impactWall || []).length,
+    prayerRequests: (db.prayerWall || []).length,
+  });
 });
 
 // Lookup a single participant's progress (for "my progress" view)
