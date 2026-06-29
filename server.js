@@ -18,22 +18,34 @@ const PORT = process.env.PORT || 4000;
 const DB_PATH = path.join(__dirname, "db.json");
 
 // ---------- Tiny JSON "database" ----------
+function freshDB() {
+  return {
+    participants: {}, checkins: [], quizSubmissions: [],
+    impactWall: [], prayerWall: [], testimonyWall: [],
+    linkClicks: { mixlr: 0, youtube: 0 },
+    users: {},        // id -> user record (with hashed password)
+    userLogins: {},   // loginKey(lowercased phone/email) -> userId
+    sessions: {},     // token -> { userId, role, createdAt }
+    events: [],       // unified activity log
+    gamePlays: [],    // word-climb / seven-mountains results
+    fiveMinutes: [],  // "Five Minutes With…" guest entries (staff-posted)
+  };
+}
 function loadDB() {
   if (!fs.existsSync(DB_PATH)) {
-    const fresh = { participants: {}, checkins: [], quizSubmissions: [], impactWall: [], prayerWall: [], testimonyWall: [], linkClicks: { mixlr: 0, youtube: 0 } };
+    const fresh = freshDB();
     fs.writeFileSync(DB_PATH, JSON.stringify(fresh, null, 2));
     return fresh;
   }
   try {
     const db = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
-    if (!db.impactWall) db.impactWall = []; // upgrade older db.json files in place
-    if (!db.prayerWall) db.prayerWall = []; // upgrade older db.json files in place
-    if (!db.testimonyWall) db.testimonyWall = []; // upgrade older db.json files in place
-    if (!db.linkClicks) db.linkClicks = { mixlr: 0, youtube: 0 }; // upgrade older db.json files in place
+    // upgrade older db.json files in place
+    const f = freshDB();
+    for (const k of Object.keys(f)) if (db[k] === undefined) db[k] = f[k];
     return db;
   } catch (e) {
     console.error("DB read failed, starting fresh:", e.message);
-    return { participants: {}, checkins: [], quizSubmissions: [], impactWall: [], prayerWall: [], testimonyWall: [], linkClicks: { mixlr: 0, youtube: 0 } };
+    return freshDB();
   }
 }
 
@@ -117,6 +129,94 @@ function leaderboardView(db) {
     .slice(0, 50);
 }
 
+// Send a plain-text / CSV response (with CORS)
+function sendText(res, status, text, contentType, filename) {
+  const headers = {
+    "Content-Type": contentType || "text/plain; charset=utf-8",
+    "Access-Control-Allow-Origin": "*",
+  };
+  if (filename) headers["Content-Disposition"] = `attachment; filename="${filename}"`;
+  res.writeHead(status, headers);
+  res.end(text);
+}
+
+// ---------- Auth helpers ----------
+const ROLES = ["admin", "staff", "guest", "attendant"];
+// Codes that authorise an elevated role at registration. Override in env.
+const ROLE_CODES = {
+  admin: process.env.ADMIN_CODE || "rccg-admin-2026",
+  staff: process.env.STAFF_CODE || "rccg-staff-2026",
+  guest: process.env.GUEST_CODE || "rccg-guest-2026",
+  // attendant needs no code
+};
+
+function hashPassword(password, salt) {
+  const s = salt || crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(String(password), s, 64).toString("hex");
+  return { salt: s, hash };
+}
+function verifyPassword(password, salt, expectedHash) {
+  const { hash } = hashPassword(password, salt);
+  const a = Buffer.from(hash, "hex");
+  const b = Buffer.from(expectedHash, "hex");
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+function makeToken() { return crypto.randomBytes(24).toString("hex"); }
+
+// Pull a session token from Authorization header, body, or ?token=
+function getToken(req, body, url) {
+  const auth = req.headers["authorization"] || "";
+  if (auth.toLowerCase().startsWith("bearer ")) return auth.slice(7).trim();
+  if (body && body.token) return String(body.token);
+  if (url) { const t = url.searchParams.get("token"); if (t) return t; }
+  return null;
+}
+function getUser(db, token) {
+  if (!token) return null;
+  const sess = db.sessions[token];
+  if (!sess) return null;
+  return db.users[sess.userId] || null;
+}
+// Public-safe view of a user
+function userView(u) {
+  if (!u) return null;
+  return { id: u.id, name: u.name, role: u.role, phone: u.phone || "", email: u.email || "", createdAt: u.createdAt };
+}
+// Is the request from an admin? (admin token OR legacy ADMIN_KEY)
+function isAdminReq(db, req, body, url) {
+  const u = getUser(db, getToken(req, body, url));
+  if (u && u.role === "admin") return true;
+  const ADMIN_KEY = process.env.ADMIN_KEY;
+  if (ADMIN_KEY && url && url.searchParams.get("key") === ADMIN_KEY) return true;
+  if (ADMIN_KEY && body && body.key === ADMIN_KEY) return true;
+  return false;
+}
+function hasRole(db, req, body, url, roles) {
+  const u = getUser(db, getToken(req, body, url));
+  if (u && roles.includes(u.role)) return true;
+  // ADMIN_KEY counts as admin
+  const ADMIN_KEY = process.env.ADMIN_KEY;
+  if (roles.includes("admin") && ADMIN_KEY) {
+    if ((url && url.searchParams.get("key") === ADMIN_KEY) || (body && body.key === ADMIN_KEY)) return true;
+  }
+  return false;
+}
+
+// Append to the unified activity log
+function logEvent(db, type, info) {
+  db.events.push({
+    id: crypto.randomUUID(),
+    type,                                  // checkin | quiz | prayer | impact | testimony | game | click | login | register
+    name: (info && info.name) || "",
+    role: (info && info.role) || "",
+    userId: (info && info.userId) || null,
+    detail: (info && info.detail) || "",
+    at: new Date().toISOString(),
+  });
+  // keep the log from growing without bound on the free tier
+  if (db.events.length > 20000) db.events = db.events.slice(-15000);
+}
+
 // ---------- Routes ----------
 const routes = [];
 function route(method, pattern, handler) {
@@ -149,6 +249,7 @@ route("POST", "/api/checkin", async (req, res) => {
       venue,
       at: new Date().toISOString(),
     });
+    logEvent(db, "checkin", { name: p.name, detail: venue });
     saveDB(db);
   }
 
@@ -199,6 +300,7 @@ route("POST", "/api/quiz/submit", async (req, res) => {
     total: total || null,
     at: new Date().toISOString(),
   });
+  logEvent(db, "quiz", { name: p.name, detail: `score ${score}/${total || "?"}` });
   saveDB(db);
 
   send(res, 200, {
@@ -242,6 +344,7 @@ route("POST", "/api/impact/submit", async (req, res) => {
     message: message.trim(),
     at: new Date().toISOString(),
   });
+  logEvent(db, "impact", { name: p.name, detail: message.trim().slice(0, 80) });
   saveDB(db);
 
   send(res, 200, {
@@ -288,6 +391,7 @@ route("POST", "/api/prayer/submit", async (req, res) => {
     prayedFor: 0,
     at: new Date().toISOString(),
   });
+  logEvent(db, "prayer", { name: p.name, detail: request.trim().slice(0, 80) });
   saveDB(db);
 
   send(res, 200, {
@@ -348,6 +452,7 @@ route("POST", "/api/testimony/submit", async (req, res) => {
     testimony: testimony.trim(),
     at: new Date().toISOString(),
   });
+  logEvent(db, "testimony", { name: p.name, detail: (mountain || "").trim() });
   saveDB(db);
 
   send(res, 200, {
@@ -375,23 +480,48 @@ route("POST", "/api/track/click", async (req, res) => {
   const db = loadDB();
   if (!db.linkClicks) db.linkClicks = { mixlr: 0, youtube: 0 };
   db.linkClicks[target] = (db.linkClicks[target] || 0) + 1;
+  logEvent(db, "click", { detail: target });
   saveDB(db);
   send(res, 200, { ok: true, linkClicks: db.linkClicks });
+});
+
+// Track a game play (Word Climb / Seven Mountains) — optional auth
+// body: { game, name, score, token }
+route("POST", "/api/track/game", async (req, res) => {
+  const body = await readBody(req);
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const game = (body.game || "").trim();
+  if (!game) return send(res, 400, { ok: false, error: "game is required" });
+  const db = loadDB();
+  const user = getUser(db, getToken(req, body, url));
+  const name = (body.name || (user && user.name) || "Guest").toString().trim();
+  db.gamePlays.push({
+    id: crypto.randomUUID(),
+    game,
+    name,
+    score: typeof body.score === "number" ? body.score : null,
+    userId: user ? user.id : null,
+    at: new Date().toISOString(),
+  });
+  logEvent(db, "game", { name, role: user ? user.role : "", userId: user ? user.id : null, detail: game });
+  saveDB(db);
+  send(res, 200, { ok: true });
 });
 
 // Admin report — link clicks, quiz takers, and check-ins.
 // Optionally protected: set ADMIN_KEY in the environment, then call
 // /api/report?key=YOUR_KEY. If ADMIN_KEY is not set, the report is open.
 route("GET", "/api/report", async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const db = loadDB();
+  // Allow an admin account token OR the legacy ADMIN_KEY. If no ADMIN_KEY is
+  // set and no admin is logged in, the report stays open (demo-friendly).
   const ADMIN_KEY = process.env.ADMIN_KEY;
-  if (ADMIN_KEY) {
-    const u = new URL(req.url, `http://${req.headers.host}`);
-    if (u.searchParams.get("key") !== ADMIN_KEY) {
-      return send(res, 401, { ok: false, error: "unauthorized" });
-    }
+  const adminLoggedIn = (() => { const u = getUser(db, getToken(req, null, url)); return u && u.role === "admin"; })();
+  if (ADMIN_KEY && !adminLoggedIn && url.searchParams.get("key") !== ADMIN_KEY) {
+    return send(res, 401, { ok: false, error: "unauthorized" });
   }
 
-  const db = loadDB();
   const clicks = db.linkClicks || { mixlr: 0, youtube: 0 };
 
   // Quiz takers: participants who have completed the quiz at least once
@@ -437,6 +567,221 @@ route("GET", "/api/report", async (req, res) => {
   });
 });
 
+// ===================== AUTH =====================
+
+// Register a new account.
+// body: { name, password, phone?, email?, role?, code? }
+route("POST", "/api/auth/register", async (req, res) => {
+  const body = await readBody(req);
+  const name = (body.name || "").trim();
+  const password = String(body.password || "");
+  const phone = (body.phone || "").trim();
+  const email = (body.email || "").trim().toLowerCase();
+  let role = (body.role || "attendant").trim();
+
+  if (!name) return send(res, 400, { ok: false, error: "name is required" });
+  if (password.length < 6) return send(res, 400, { ok: false, error: "password must be at least 6 characters" });
+  if (!phone && !email) return send(res, 400, { ok: false, error: "a phone number or email is required" });
+  if (!ROLES.includes(role)) role = "attendant";
+
+  // Elevated roles require the correct code
+  if (role !== "attendant") {
+    if (!body.code || body.code !== ROLE_CODES[role]) {
+      return send(res, 403, { ok: false, error: `a valid ${role} code is required to register as ${role}` });
+    }
+  }
+
+  const db = loadDB();
+  const loginKey = (email || phone).toLowerCase();
+  if (db.userLogins[loginKey]) {
+    return send(res, 409, { ok: false, error: "an account with that phone/email already exists — please log in" });
+  }
+
+  const id = crypto.randomUUID();
+  const { salt, hash } = hashPassword(password);
+  db.users[id] = {
+    id, name, phone, email, role,
+    salt, passHash: hash,
+    createdAt: new Date().toISOString(),
+    lastLoginAt: new Date().toISOString(),
+  };
+  db.userLogins[loginKey] = id;
+  if (phone) db.userLogins[phone.toLowerCase()] = id; // allow login by phone too
+
+  const token = makeToken();
+  db.sessions[token] = { userId: id, role, createdAt: new Date().toISOString() };
+  logEvent(db, "register", { name, role, userId: id });
+  saveDB(db);
+
+  send(res, 200, { ok: true, token, user: userView(db.users[id]) });
+});
+
+// Log in.
+// body: { login (phone or email), password }
+route("POST", "/api/auth/login", async (req, res) => {
+  const body = await readBody(req);
+  const login = (body.login || "").trim().toLowerCase();
+  const password = String(body.password || "");
+  if (!login || !password) return send(res, 400, { ok: false, error: "login and password are required" });
+
+  const db = loadDB();
+  const userId = db.userLogins[login];
+  const user = userId && db.users[userId];
+  if (!user || !verifyPassword(password, user.salt, user.passHash)) {
+    return send(res, 401, { ok: false, error: "incorrect login or password" });
+  }
+  user.lastLoginAt = new Date().toISOString();
+  const token = makeToken();
+  db.sessions[token] = { userId: user.id, role: user.role, createdAt: new Date().toISOString() };
+  logEvent(db, "login", { name: user.name, role: user.role, userId: user.id });
+  saveDB(db);
+  send(res, 200, { ok: true, token, user: userView(user) });
+});
+
+// Who am I? (token in Authorization header or ?token=)
+route("GET", "/api/auth/me", async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const db = loadDB();
+  const user = getUser(db, getToken(req, null, url));
+  if (!user) return send(res, 401, { ok: false, error: "not logged in" });
+  send(res, 200, { ok: true, user: userView(user) });
+});
+
+// Log out (invalidate token)
+route("POST", "/api/auth/logout", async (req, res) => {
+  const body = await readBody(req);
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const token = getToken(req, body, url);
+  const db = loadDB();
+  if (token && db.sessions[token]) { delete db.sessions[token]; saveDB(db); }
+  send(res, 200, { ok: true });
+});
+
+// ===================== FIVE MINUTES WITH… =====================
+
+route("GET", "/api/five-minutes/recent", async (req, res) => {
+  const db = loadDB();
+  send(res, 200, { ok: true, items: db.fiveMinutes.slice().reverse() });
+});
+
+// Add a guest entry — staff or admin only.
+// body: { token, status, name, role, when, blurb }
+route("POST", "/api/five-minutes/add", async (req, res) => {
+  const body = await readBody(req);
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const db = loadDB();
+  if (!hasRole(db, req, body, url, ["staff", "admin"])) {
+    return send(res, 403, { ok: false, error: "staff or admin login required" });
+  }
+  const name = (body.name || "").trim();
+  if (!name) return send(res, 400, { ok: false, error: "guest name is required" });
+  const poster = getUser(db, getToken(req, body, url));
+  const entry = {
+    id: crypto.randomUUID(),
+    status: ["today", "upcoming", "aired"].includes(body.status) ? body.status : "upcoming",
+    name,
+    role: (body.role || "").trim(),
+    when: (body.when || "").trim(),
+    blurb: (body.blurb || "").trim().slice(0, 400),
+    postedBy: poster ? poster.name : "admin",
+    at: new Date().toISOString(),
+  };
+  db.fiveMinutes.push(entry);
+  saveDB(db);
+  send(res, 200, { ok: true, entry });
+});
+
+// Delete a guest entry — staff or admin only.
+route("POST", "/api/five-minutes/delete", async (req, res) => {
+  const body = await readBody(req);
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const db = loadDB();
+  if (!hasRole(db, req, body, url, ["staff", "admin"])) {
+    return send(res, 403, { ok: false, error: "staff or admin login required" });
+  }
+  const before = db.fiveMinutes.length;
+  db.fiveMinutes = db.fiveMinutes.filter((e) => e.id !== body.id);
+  saveDB(db);
+  send(res, 200, { ok: true, removed: before - db.fiveMinutes.length });
+});
+
+// ===================== ADMIN ANALYTICS =====================
+
+// Activity stats for the dashboard graph (admin only).
+route("GET", "/api/admin/stats", async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const db = loadDB();
+  if (!isAdminReq(db, req, null, url)) return send(res, 401, { ok: false, error: "unauthorized" });
+
+  // Canonical totals (robust even before event logging existed)
+  const totals = {
+    checkins: db.checkins.length,
+    quizzes: db.quizSubmissions.length,
+    prayers: db.prayerWall.length,
+    impact: db.impactWall.length,
+    testimonies: db.testimonyWall.length,
+    games: db.gamePlays.length,
+    clicks: (db.linkClicks.mixlr || 0) + (db.linkClicks.youtube || 0),
+    logins: db.events.filter((e) => e.type === "login").length,
+  };
+
+  // Per-day breakdown from the event log
+  const byDay = {};
+  db.events.forEach((e) => {
+    const day = (e.at || "").slice(0, 10);
+    if (!day) return;
+    if (!byDay[day]) byDay[day] = {};
+    byDay[day][e.type] = (byDay[day][e.type] || 0) + 1;
+  });
+
+  const usersByRole = { admin: 0, staff: 0, guest: 0, attendant: 0 };
+  Object.values(db.users).forEach((u) => { usersByRole[u.role] = (usersByRole[u.role] || 0) + 1; });
+
+  send(res, 200, {
+    ok: true,
+    generatedAt: new Date().toISOString(),
+    totals,
+    byDay,
+    usersByRole,
+    totalUsers: Object.keys(db.users).length,
+  });
+});
+
+// Daily activity export as CSV (admin only). ?date=YYYY-MM-DD or ?date=all
+route("GET", "/api/admin/activity.csv", async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const db = loadDB();
+  if (!isAdminReq(db, req, null, url)) return sendText(res, 401, "unauthorized", "text/plain");
+
+  const dateParam = url.searchParams.get("date") || new Date().toISOString().slice(0, 10);
+  const csvEsc = (v) => `"${String(v == null ? "" : v).replace(/"/g, '""')}"`;
+
+  // Merge every activity into one timestamped list
+  const rows = [];
+  db.checkins.forEach((c) => rows.push([c.at, "check-in", c.name, c.venue]));
+  db.quizSubmissions.forEach((q) => rows.push([q.at, "quiz", q.name, `score ${q.score}/${q.total || "?"}`]));
+  db.prayerWall.forEach((p) => rows.push([p.at, "prayer", p.name, p.request]));
+  db.impactWall.forEach((m) => rows.push([m.at, "60s-impact", m.name, m.message]));
+  db.testimonyWall.forEach((t) => rows.push([t.at, "testimony", t.name, t.mountain || t.testimony]));
+  db.gamePlays.forEach((g) => rows.push([g.at, "game", g.name, g.game + (g.score != null ? ` (${g.score})` : "")]));
+  db.events.filter((e) => ["login", "register", "click"].includes(e.type))
+    .forEach((e) => rows.push([e.at, e.type, e.name, e.detail]));
+
+  const filtered = dateParam === "all" ? rows : rows.filter((r) => (r[0] || "").slice(0, 10) === dateParam);
+  filtered.sort((a, b) => new Date(a[0]) - new Date(b[0]));
+
+  const header = "Timestamp,Date,Time,Activity,Name,Detail";
+  const lines = filtered.map((r) => {
+    const d = new Date(r[0]);
+    const date = isNaN(d) ? "" : d.toISOString().slice(0, 10);
+    const time = isNaN(d) ? "" : d.toISOString().slice(11, 19);
+    return [r[0], date, time, r[1], r[2], r[3]].map(csvEsc).join(",");
+  });
+  const csv = [header, ...lines].join("\r\n");
+  const fname = `mountain-movers-activity-${dateParam}.csv`;
+  sendText(res, 200, csv, "text/csv; charset=utf-8", fname);
+});
+
 // Lookup a single participant's progress (for "my progress" view)
 route("GET", "/api/participant/:id", async (req, res, params) => {
   const db = loadDB();
@@ -477,7 +822,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
     });
     return res.end();
   }
