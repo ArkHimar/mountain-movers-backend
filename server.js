@@ -15,9 +15,17 @@ const path = require("path");
 const crypto = require("crypto");
 
 const PORT = process.env.PORT || 4000;
-const DB_PATH = path.join(__dirname, "db.json");
+// DB_PATH can be overridden via env. Point it at a Render persistent disk
+// (e.g. /data/db.json) so data survives restarts and redeploys.
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, "db.json");
 
-// ---------- Tiny JSON "database" ----------
+// ---------- Database ----------
+// Two storage modes:
+//   • MongoDB (persistent, survives restarts) when MONGO_URI is set.
+//     The whole state lives in one document; we keep it cached in memory
+//     and write it through to Mongo on every change. Reads are synchronous
+//     (no race conditions on a single instance), routes stay unchanged.
+//   • Local JSON file otherwise (fine for local dev; ephemeral on Render).
 function freshDB() {
   return {
     participants: {}, checkins: [], quizSubmissions: [],
@@ -29,28 +37,80 @@ function freshDB() {
     events: [],       // unified activity log
     gamePlays: [],    // word-climb / seven-mountains results
     fiveMinutes: [],  // "Five Minutes With…" guest entries (staff-posted)
+    bulletins: [],    // Convention News Bulletin updates (staff-posted)
   };
 }
+function migrateInPlace(db) {
+  const f = freshDB();
+  for (const k of Object.keys(f)) if (db[k] === undefined) db[k] = f[k];
+  return db;
+}
+
+let storageMode = process.env.MONGO_URI ? "mongo" : "file";
+let CACHE = null;        // in-memory state (mongo mode)
+let mongoColl = null;    // collection holding the single state document
+
 function loadDB() {
+  if (storageMode === "mongo") return CACHE;  // already in memory
+  // ---- file mode ----
   if (!fs.existsSync(DB_PATH)) {
     const fresh = freshDB();
     fs.writeFileSync(DB_PATH, JSON.stringify(fresh, null, 2));
     return fresh;
   }
   try {
-    const db = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
-    // upgrade older db.json files in place
-    const f = freshDB();
-    for (const k of Object.keys(f)) if (db[k] === undefined) db[k] = f[k];
-    return db;
+    return migrateInPlace(JSON.parse(fs.readFileSync(DB_PATH, "utf8")));
   } catch (e) {
     console.error("DB read failed, starting fresh:", e.message);
     return freshDB();
   }
 }
 
+// Coalesced write-through to Mongo so concurrent saves never clash.
+let persisting = false, dirtyAgain = false;
+async function persistNow() {
+  if (!mongoColl || !CACHE) return;
+  if (persisting) { dirtyAgain = true; return; }
+  persisting = true;
+  try {
+    // Store the whole state as a JSON string so map keys containing "." or "$"
+    // (emails, phones) never clash with MongoDB field-name rules.
+    await mongoColl.replaceOne(
+      { _id: "main" },
+      { _id: "main", json: JSON.stringify(CACHE), updatedAt: new Date() },
+      { upsert: true }
+    );
+  } catch (e) {
+    console.error("Mongo save failed (will retry on next change):", e.message);
+  }
+  persisting = false;
+  if (dirtyAgain) { dirtyAgain = false; persistNow(); }
+}
+
 function saveDB(db) {
+  if (storageMode === "mongo") {
+    CACHE = db;            // db is the same object reference as CACHE
+    persistNow();          // fire-and-forget; coalesced
+    return;
+  }
   fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
+}
+
+async function initMongo() {
+  const { MongoClient } = require("mongodb");
+  const client = new MongoClient(process.env.MONGO_URI, { serverSelectionTimeoutMS: 15000 });
+  await client.connect();
+  const dbName = process.env.MONGO_DB || "mountainmovers";
+  mongoColl = client.db(dbName).collection("state");
+  const doc = await mongoColl.findOne({ _id: "main" });
+  let loaded = freshDB();
+  if (doc && doc.json) {
+    try { loaded = JSON.parse(doc.json); }
+    catch (e) { console.error("Stored state was corrupt; starting fresh:", e.message); }
+  }
+  CACHE = migrateInPlace(loaded);
+  await persistNow();
+  console.log("Connected to MongoDB; persistent state loaded.");
 }
 
 // Points configuration — change freely
@@ -705,6 +765,56 @@ route("POST", "/api/five-minutes/delete", async (req, res) => {
   send(res, 200, { ok: true, removed: before - db.fiveMinutes.length });
 });
 
+// ===================== NEWS BULLETIN =====================
+
+route("GET", "/api/bulletin/recent", async (req, res) => {
+  const db = loadDB();
+  send(res, 200, { ok: true, items: db.bulletins.slice().reverse() });
+});
+
+// Add a bulletin update — staff or admin only.
+// body: { token, category, day, time, title, text }
+route("POST", "/api/bulletin/add", async (req, res) => {
+  const body = await readBody(req);
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const db = loadDB();
+  if (!hasRole(db, req, body, url, ["staff", "admin"])) {
+    return send(res, 403, { ok: false, error: "staff or admin login required" });
+  }
+  const title = (body.title || "").trim();
+  const text = (body.text || "").trim();
+  if (!title && !text) return send(res, 400, { ok: false, error: "a title or text is required" });
+  const cats = ["schedule", "security", "medical", "weather", "venue", "general"];
+  const poster = getUser(db, getToken(req, body, url));
+  const entry = {
+    id: crypto.randomUUID(),
+    category: cats.includes(body.category) ? body.category : "general",
+    day: (body.day || "").trim(),
+    time: (body.time || "").trim(),
+    title,
+    text: text.slice(0, 600),
+    postedBy: poster ? poster.name : "staff",
+    at: new Date().toISOString(),
+  };
+  db.bulletins.push(entry);
+  saveDB(db);
+  send(res, 200, { ok: true, entry });
+});
+
+// Delete a bulletin update — staff or admin only.
+route("POST", "/api/bulletin/delete", async (req, res) => {
+  const body = await readBody(req);
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const db = loadDB();
+  if (!hasRole(db, req, body, url, ["staff", "admin"])) {
+    return send(res, 403, { ok: false, error: "staff or admin login required" });
+  }
+  const before = db.bulletins.length;
+  db.bulletins = db.bulletins.filter((e) => e.id !== body.id);
+  saveDB(db);
+  send(res, 200, { ok: true, removed: before - db.bulletins.length });
+});
+
 // ===================== ADMIN ANALYTICS =====================
 
 // Activity stats for the dashboard graph (admin only).
@@ -838,6 +948,17 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`Mountain Movers backend running on port ${PORT}`);
-});
+async function start() {
+  if (storageMode === "mongo") {
+    try {
+      await initMongo();
+    } catch (e) {
+      console.error("MongoDB connection failed — falling back to local file store:", e.message);
+      storageMode = "file";
+    }
+  }
+  server.listen(PORT, () => {
+    console.log(`Mountain Movers backend running on port ${PORT} (storage: ${storageMode})`);
+  });
+}
+start();
