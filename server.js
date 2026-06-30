@@ -38,6 +38,7 @@ function freshDB() {
     gamePlays: [],    // word-climb / seven-mountains results
     fiveMinutes: [],  // "Five Minutes With…" guest entries (staff-posted)
     bulletins: [],    // Convention News Bulletin updates (staff-posted)
+    diaries: [],      // Convention Diary entries (staff-posted) with attendee comments
   };
 }
 function migrateInPlace(db) {
@@ -813,6 +814,138 @@ route("POST", "/api/bulletin/delete", async (req, res) => {
   db.bulletins = db.bulletins.filter((e) => e.id !== body.id);
   saveDB(db);
   send(res, 200, { ok: true, removed: before - db.bulletins.length });
+});
+
+// ===================== CONVENTION DIARIES + COMMENTS =====================
+
+// Automated comment moderation (rule-based). Returns a reason string if the
+// comment is unbefitting, or null if it is clean. Keeps the diary respectful
+// without needing an external AI service.
+const MODERATION = {
+  // profanity / abuse / slurs (kept lowercase; matched as whole-ish words)
+  words: [
+    "fuck", "shit", "bitch", "bastard", "asshole", "dick", "pussy", "cunt",
+    "nigger", "nigga", "fag", "faggot", "retard", "whore", "slut", "motherfucker",
+    "idiot", "stupid", "fool", "nonsense", "rubbish", "scam", "fraud", "demon",
+    "devil", "kill", "die", "hate",
+  ],
+};
+function moderateComment(text) {
+  const t = (text || "").toLowerCase();
+  if (!t.trim()) return "empty comment";
+  // links / promotion / spam
+  if (/(https?:\/\/|www\.|\.com|\.net|\.org|\bt\.me\b|whatsapp\.com)/i.test(t)) {
+    return "links are not allowed in comments";
+  }
+  // contact-info harvesting / spam (long digit runs)
+  if (/\d{7,}/.test(t.replace(/\s/g, ""))) {
+    return "please don't post phone numbers or long number strings";
+  }
+  // profanity / abuse — match as bounded words to avoid false positives
+  for (const w of MODERATION.words) {
+    const re = new RegExp("(^|[^a-z])" + w + "([^a-z]|$)", "i");
+    if (re.test(t)) return "the comment contains language that isn't allowed here";
+  }
+  // shouting / spam: too many repeated chars
+  if (/(.)\1{6,}/.test(t)) return "please avoid spammy repeated characters";
+  return null;
+}
+
+route("GET", "/api/diary/recent", async (req, res) => {
+  const db = loadDB();
+  // newest entries first; comments kept oldest-first within each entry
+  const items = db.diaries.slice().reverse();
+  send(res, 200, { ok: true, items });
+});
+
+// Add a diary entry — staff or admin only.
+// body: { token, day, slot, title, body }
+route("POST", "/api/diary/add", async (req, res) => {
+  const body = await readBody(req);
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const db = loadDB();
+  if (!hasRole(db, req, body, url, ["staff", "admin"])) {
+    return send(res, 403, { ok: false, error: "staff or admin login required" });
+  }
+  const title = (body.title || "").trim();
+  const text = (body.body || "").trim();
+  if (!title && !text) return send(res, 400, { ok: false, error: "a title or body is required" });
+  const slots = ["Morning", "Afternoon", "Evening", "Update"];
+  const poster = getUser(db, getToken(req, body, url));
+  const entry = {
+    id: crypto.randomUUID(),
+    day: (body.day || "").trim(),
+    slot: slots.includes(body.slot) ? body.slot : "Update",
+    title,
+    body: text.slice(0, 1500),
+    postedBy: poster ? poster.name : "staff",
+    at: new Date().toISOString(),
+    comments: [],
+  };
+  db.diaries.push(entry);
+  saveDB(db);
+  send(res, 200, { ok: true, entry });
+});
+
+// Delete a diary entry — staff or admin only.
+route("POST", "/api/diary/delete", async (req, res) => {
+  const body = await readBody(req);
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const db = loadDB();
+  if (!hasRole(db, req, body, url, ["staff", "admin"])) {
+    return send(res, 403, { ok: false, error: "staff or admin login required" });
+  }
+  const before = db.diaries.length;
+  db.diaries = db.diaries.filter((e) => e.id !== body.id);
+  saveDB(db);
+  send(res, 200, { ok: true, removed: before - db.diaries.length });
+});
+
+// Add a comment to a diary entry — open to anyone, auto-moderated.
+// body: { entryId, name, text }
+route("POST", "/api/diary/comment", async (req, res) => {
+  const body = await readBody(req);
+  const name = (body.name || "").trim();
+  const text = (body.text || "").trim();
+  if (!name) return send(res, 400, { ok: false, error: "please add your name" });
+  if (!text) return send(res, 400, { ok: false, error: "please write a comment" });
+  if (text.length > 400) return send(res, 400, { ok: false, error: "comment is too long (max 400 characters)" });
+
+  const reason = moderateComment(text);
+  if (reason) {
+    return send(res, 422, { ok: false, moderated: true, error: "Your comment wasn't posted: " + reason + "." });
+  }
+
+  const db = loadDB();
+  const entry = db.diaries.find((e) => e.id === body.entryId);
+  if (!entry) return send(res, 404, { ok: false, error: "diary entry not found" });
+  if (!entry.comments) entry.comments = [];
+  const comment = {
+    id: crypto.randomUUID(),
+    name: name.slice(0, 60),
+    text: text.slice(0, 400),
+    at: new Date().toISOString(),
+  };
+  entry.comments.push(comment);
+  saveDB(db);
+  send(res, 200, { ok: true, comment });
+});
+
+// Delete a comment — staff or admin only.
+// body: { token, entryId, commentId }
+route("POST", "/api/diary/comment/delete", async (req, res) => {
+  const body = await readBody(req);
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const db = loadDB();
+  if (!hasRole(db, req, body, url, ["staff", "admin"])) {
+    return send(res, 403, { ok: false, error: "staff or admin login required" });
+  }
+  const entry = db.diaries.find((e) => e.id === body.entryId);
+  if (!entry || !entry.comments) return send(res, 404, { ok: false, error: "not found" });
+  const before = entry.comments.length;
+  entry.comments = entry.comments.filter((c) => c.id !== body.commentId);
+  saveDB(db);
+  send(res, 200, { ok: true, removed: before - entry.comments.length });
 });
 
 // ===================== ADMIN ANALYTICS =====================
